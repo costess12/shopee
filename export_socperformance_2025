@@ -1,0 +1,150 @@
+WITH depara AS (
+    SELECT
+        distinct
+        id AS station_id
+        ,station_type
+        ,station_name
+        -- ,station_code
+    FROM spx_mart.dim_spx_station_br
+    WHERE grass_date=(SELECT MAX(grass_date) FROM spx_mart.dim_spx_station_br WHERE grass_date IS NOT NULL)
+) 
+
+,depara_dop AS (
+    SELECT 
+        service_point_name
+        ,service_point_id
+    FROM spx_mart.dim_spx_service_point_br
+    WHERE TRUE
+        AND grass_date=(SELECT MAX(grass_date) FROM spx_mart.dim_spx_service_point_br WHERE grass_date <= DATE(CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo'))
+)
+,big AS (
+    SELECT 
+        dop_dop
+        , dop_name
+        , array_join(array_sort(array_distinct(array_agg(operation))), '/') AS operation 
+    FROM dev_brbi_opslgc.svps_proj_fm 
+    GROUP BY 1,2
+)
+,lh AS (
+    SELECT 
+        CASE 
+            WHEN lh.origin_id IN (10579,10609,10610) -- FMH-GIG-01,FMH-GRU-01,FMH-VCP-01 -- Lista de FMHs CB
+            THEN 'CB'
+            WHEN 
+                dop_name IS NOT NULL 
+                OR SUBSTR(orig.station_name, 1, 21) = 'PROJETO FM BIG SELLER'
+            THEN 'BIG SELLER/PUDO'
+            WHEN orig.station_type=9
+            THEN 'PUDO SVP'
+            WHEN orig.station_type=7
+                AND trans.is_actual_transshipment_current=1
+            THEN 'Transhipment (FMH)'
+            WHEN orig.station_type=2
+                AND trans.is_actual_transshipment_current=1
+            THEN 'Transhipment (SOC)'
+            WHEN orig.station_type=18
+            THEN 'Full'
+            WHEN orig.station_type=2
+            THEN 'LH SOC -> SOC'
+            WHEN orig.station_type = 3 
+            THEN 'LMH'
+            WHEN orig.station_type =12
+            THEN 'XPT'
+            WHEN orig.station_type=7 
+            THEN 'FMH' 
+         END AS origin_station_type
+        ,destination
+        ,CASE 
+            WHEN HOUR(eta_destination_realized)<6
+            THEN DATE(eta_destination_realized - INTERVAL '1' DAY)
+            ELSE DATE(eta_destination_realized)
+         END AS cutoff_date_arrived
+        ,COUNT(DISTINCT ship.shipment_id) AS arrived
+    FROM brbi_opslgc.da_log_linehaul_order_details_per_shipment_v2 ship
+    INNER JOIN brbi_opslgc.da_log_linehaul_trip_base_v3 lh
+        ON ship.lh_trip_ro=lh.trip_number
+    LEFT JOIN brbi_opslgc.da_log_spx_transshipment_hourly trans
+        ON trans.shipment_id=ship.shipment_id
+        AND trans.current_station_id=ship.station_id
+        AND trans.last_to=ship.to_number
+        AND trans.first_packed_date >= DATE('2025-07-01') --partition
+    LEFT JOIN depara orig
+        ON lh.origin_id = orig.station_id
+    LEFT JOIN depara dest
+        ON lh.destination_id = dest.station_id
+    LEFT JOIN depara_dop
+        ON depara_dop.service_point_name=orig.station_name
+    LEFT JOIN big
+        ON CAST(depara_dop.service_point_id AS VARCHAR)=REPLACE(big.dop_dop,'DOP')
+    WHERE dest.station_type IN (2,18)
+        AND lh.eta_destination_realized >= CAST('2025-07-01 06:00:00' AS TIMESTAMP) 
+        AND ship.date_lhtransporting >= DATE('2025-07-01') --parititon
+    GROUP BY 1,2,3
+)
+, vol AS (
+    select 
+    actual_station_name AS station_name
+        ,cutoff_date_per_6h_rule AS cutoff_date
+        -- ,REVERSE(shift_per_6h_rule) AS shift
+        ,CASE 
+            WHEN previous_station_id IN (10579,10609,10610) -- FMH-GIG-01,FMH-GRU-01,FMH-VCP-01 -- Lista de FMHs CB
+            THEN 'CB'
+            WHEN 
+                dop_name IS NOT NULL 
+                OR SUBSTR(previous_station_name, 1, 21) = 'PROJETO FM BIG SELLER'
+            THEN 'BIG SELLER/PUDO'
+            WHEN previous_station_type='PUDO'
+            THEN 'PUDO SVP'
+            WHEN previous_station_type='FM Seller'
+            THEN 'FM'
+            WHEN 
+                    previous_station_type='FMH'
+                AND transbordo_plan='is_planned_transbordo' 
+                AND transbordo_actual='is_actual_transbordo'
+            THEN 'Transhipment (FMH)'
+            WHEN 
+                    previous_station_type='SOC'
+                AND transbordo_plan='is_planned_transbordo' 
+                AND transbordo_actual='is_actual_transbordo'
+            THEN 'Transhipment (SOC)'
+            WHEN previous_station_type='Fulfillment'
+            THEN 'Full'
+            WHEN previous_station_type='SOC'
+            THEN 'LH SOC -> SOC'
+            ELSE previous_station_type
+         END AS previous_station_type
+        , COALESCE(sum(SOC_Handover),0)  as "SOC_Handover" 
+        , COALESCE(sum(SOC_LHPacked),0)  as "SOC_LHPacked" 
+        , COALESCE(sum(SOC_Packed),0)  as "SOC_Packed" 
+        , COALESCE(sum(SOC_RECEIVED),0)  as "SOC_RECEIVED" 
+        , COALESCE(SUM(soc_packing),0) AS "SOC_Packing"
+
+
+    from brbi_opslgc.soc_volumetry_hourly t1
+    LEFT JOIN depara_dop
+        ON depara_dop.service_point_name=previous_station_name
+    LEFT JOIN big
+        ON CAST(depara_dop.service_point_id AS VARCHAR)=REPLACE(big.dop_dop,'DOP')
+    where TRUE 
+        -- cutoff_date_per_6h_rule BETWEEN DATE('2025-01-01') AND date(current_timestamp at time zone 'America/Sao_Paulo') - interval '1' day 
+        AND calendar_date BETWEEN DATE('2025-01-01') AND date(current_timestamp at time zone 'America/Sao_Paulo')
+    group by 1,2,3--,4
+    HAVING COALESCE(sum(SOC_Handover),sum(SOC_LHPacked),sum(SOC_Packed),sum(SOC_RECEIVED),SUM(soc_packing)) IS NOT NULL
+)
+SELECT 
+     COALESCE(vol.station_name,lh.destination) AS station_name
+    ,COALESCE(vol.cutoff_date,lh.cutoff_date_arrived) AS cutoff_date
+    ,COALESCE(vol.previous_station_type,lh.origin_station_type) AS previous_station_type
+    ,COALESCE(vol.SOC_Handover,0) AS SOC_Handover
+    ,COALESCE(vol.SOC_LHPacked,0) AS SOC_LHPacked
+    ,COALESCE(vol.SOC_Packed,0) AS SOC_Packed
+    ,COALESCE(vol.SOC_RECEIVED,0) AS SOC_RECEIVED
+    ,COALESCE(vol.SOC_Packing,0) AS SOC_Packing
+    ,COALESCE(lh.Arrived,0) AS Arrived
+FROM vol 
+LEFT JOIN lh
+    ON vol.station_name=lh.destination
+    AND vol.cutoff_date=lh.cutoff_date_arrived
+    AND vol.previous_station_type=lh.origin_station_type
+WHERE COALESCE(vol.cutoff_date,lh.cutoff_date_arrived) BETWEEN DATE('2025-01-01') AND date(current_timestamp at time zone 'America/Sao_Paulo') - interval '1' day
+ORDER BY 2 DESC, 1, 3
